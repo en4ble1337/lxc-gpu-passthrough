@@ -1,0 +1,1418 @@
+# Ultimate Guide: GPU Passthrough to LXC Containers on Proxmox
+
+Version 1.0 - May 2025
+
+## Table of Contents
+
+1. [Introduction](#introduction)
+2. [Pre-Installation Checks](#pre-installation-checks)
+3. [Installing GPU Drivers on Proxmox Host](#installing-gpu-drivers-on-proxmox-host)
+4. [Creating GPU-Enabled LXC Container](#creating-gpu-enabled-lxc-container)
+5. [Configuring Container for GPU Access](#configuring-container-for-gpu-access)
+6. [Installing Software Inside Container](#installing-software-inside-container)
+7. [Testing and Verification](#testing-and-verification)
+8. [Advanced Configurations](#advanced-configurations)
+9. [Troubleshooting](#troubleshooting)
+10. [Best Practices](#best-practices)
+11. [Quick Reference Card](#quick-reference-card)
+
+---
+
+## Introduction
+
+This guide provides a complete walkthrough for setting up GPU passthrough to LXC containers on Proxmox. Unlike VM passthrough, LXC containers offer near-native performance with minimal overhead, making them ideal for GPU workloads.
+
+### Key Advantages of LXC GPU Passthrough:
+- **No virtualization overhead** - Direct hardware access
+- **Shared kernel** - Host GPU drivers work directly
+- **Easier setup** - No IOMMU/VT-d configuration required
+- **Better performance** - Near-native GPU speeds
+- **Resource efficiency** - Multiple containers can share one GPU
+
+### Prerequisites:
+- Proxmox VE 7.0 or newer
+- NVIDIA or AMD GPU
+- Basic Linux command line knowledge
+- Root access to Proxmox host
+
+---
+
+## Pre-Installation Checks
+
+### 1. Check Your GPU
+
+```bash
+# List all GPUs
+lspci | grep -i nvidia
+# or for AMD
+lspci | grep -i amd
+
+# Get detailed GPU information
+lspci -v -s $(lspci | grep VGA | cut -d' ' -f1)
+
+# Note your GPU's PCI address (e.g., 01:00.0)
+```
+
+### 2. Check Proxmox Version
+
+```bash
+pveversion
+# Ensure you're on Proxmox 7.0 or newer for best cgroup2 support
+
+# Check kernel version
+uname -r
+```
+
+### 3. Update Proxmox
+
+```bash
+# Update package lists
+apt update
+
+# Upgrade all packages
+apt dist-upgrade -y
+
+# Clean up
+apt autoremove -y
+
+# Reboot to ensure latest kernel is loaded
+reboot
+```
+
+### 4. Check Available Storage
+
+```bash
+# Check disk space
+df -h
+
+# Ensure at least 10GB free space for drivers and tools
+```
+
+---
+
+## Installing GPU Drivers on Proxmox Host
+
+### For NVIDIA GPUs
+
+#### Method 1: Official NVIDIA Drivers from Debian Repository (Recommended)
+
+```bash
+# Install prerequisites
+apt update
+apt install -y pve-headers-$(uname -r) build-essential dkms
+
+# Add non-free repositories INCLUDING non-free-firmware (CRITICAL!)
+nano /etc/apt/sources.list
+
+# Make sure your lines look like this:
+deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
+deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+
+# Update package lists
+apt update
+
+# Install pve-firmware (replaces firmware-misc-nonfree in Proxmox)
+apt install -y pve-firmware
+
+# IMPORTANT: Blacklist nouveau driver BEFORE installing NVIDIA
+cat > /etc/modprobe.d/blacklist-nouveau.conf << 'EOF'
+blacklist nouveau
+options nouveau modeset=0
+EOF
+
+# Update initramfs to apply blacklist
+update-initramfs -u
+
+# Install NVIDIA driver components separately to handle dependencies
+apt install -y nvidia-kernel-source
+apt install -y nvidia-kernel-dkms || {
+    echo "nvidia-kernel-dkms failed, trying manual firmware installation..."
+    cd /tmp
+    wget http://ftp.debian.org/debian/pool/non-free-firmware/n/nvidia-graphics-drivers/firmware-nvidia-gsp_535.247.01-1~deb12u1_amd64.deb
+    dpkg -i firmware-nvidia-gsp_535.247.01-1~deb12u1_amd64.deb
+    apt install -y nvidia-kernel-dkms
+}
+apt install -y nvidia-driver-bin
+apt install -y nvidia-driver-libs
+apt install -y nvidia-driver
+
+# Enable nvidia-persistenced for better performance
+systemctl enable nvidia-persistenced
+systemctl start nvidia-persistenced
+
+# Create udev rules for proper permissions
+cat > /etc/udev/rules.d/70-nvidia.rules << 'EOF'
+KERNEL=="nvidia", MODE="0666"
+KERNEL=="nvidia-uvm", MODE="0666"
+KERNEL=="nvidia-uvm-tools", MODE="0666"
+KERNEL=="nvidia-modeset", MODE="0666"
+KERNEL=="nvidiactl", MODE="0666"
+EOF
+
+udevadm control --reload-rules
+udevadm trigger
+
+# Add modules to load at boot
+echo "nvidia" >> /etc/modules-load.d/nvidia.conf
+echo "nvidia-uvm" >> /etc/modules-load.d/nvidia.conf
+echo "nvidia-modeset" >> /etc/modules-load.d/nvidia.conf
+echo "nvidia-drm" >> /etc/modules-load.d/nvidia.conf
+
+# Reboot to load new drivers
+reboot
+```
+
+#### Common Issues and Solutions
+
+**Issue: firmware-nvidia-gsp not found**
+```bash
+# Download and install manually
+cd /tmp
+wget http://ftp.debian.org/debian/pool/non-free-firmware/n/nvidia-graphics-drivers/firmware-nvidia-gsp_535.247.01-1~deb12u1_amd64.deb
+dpkg -i firmware-nvidia-gsp_535.247.01-1~deb12u1_amd64.deb
+```
+
+**Issue: modprobe nvidia fails with "No such device"**
+```bash
+# Ensure nouveau is blacklisted and reboot
+cat /etc/modprobe.d/blacklist-nouveau.conf
+update-initramfs -u
+reboot
+```
+
+#### Method 2: Latest Drivers Direct from NVIDIA
+
+```bash
+# Install dependencies
+apt install -y build-essential linux-headers-$(uname -r)
+
+# Download latest driver (check https://www.nvidia.com/drivers for latest version)
+cd /tmp
+wget https://us.download.nvidia.com/XFree86/Linux-x86_64/550.54.14/NVIDIA-Linux-x86_64-550.54.14.run
+
+# Make executable
+chmod +x NVIDIA-Linux-x86_64-550.54.14.run
+
+# Install with DKMS support for automatic rebuilds on kernel updates
+./NVIDIA-Linux-x86_64-550.54.14.run --dkms --no-opengl-files
+
+# Note: --no-opengl-files prevents conflicts with Proxmox display
+
+# Reboot
+reboot
+```
+
+### For AMD GPUs
+
+```bash
+# AMD uses open-source drivers included in kernel
+# Install firmware
+apt update
+apt install -y firmware-amd-graphics
+
+# For ROCm support (compute workloads)
+# Add AMD ROCm repository
+wget -q -O - https://repo.radeon.com/rocm/rocm.gpg.key | apt-key add -
+echo 'deb [arch=amd64] https://repo.radeon.com/rocm/apt/debian/ ubuntu main' | tee /etc/apt/sources.list.d/rocm.list
+
+apt update
+apt install -y rocm-dkms
+
+# Add user to render and video groups
+usermod -a -G render,video $LOGNAME
+
+# Reboot
+reboot
+```
+
+### Verify Installation
+
+```bash
+# For NVIDIA
+nvidia-smi
+# Should display GPU information, driver version, and CUDA version
+
+# Check kernel modules
+lsmod | grep nvidia
+# Should show nvidia, nvidia_modeset, nvidia_uvm, etc.
+
+# Check device files
+ls -la /dev/nvidia*
+# Should show nvidia devices with proper permissions
+
+# For AMD
+rocm-smi
+# or
+clinfo
+# or install and run
+apt install -y radeontop
+radeontop
+```
+
+### Important Notes for Proxmox 8 / Debian 12
+
+1. **firmware-misc-nonfree is replaced by pve-firmware** in Proxmox
+2. **non-free-firmware repository is required** for nvidia-kernel-dkms dependencies
+3. **nouveau must be blacklisted** before installing NVIDIA drivers
+4. **Manual firmware download may be needed** if packages are missing from repositories
+
+---
+
+## Creating GPU-Enabled LXC Container
+
+### Option 1: Create Container via Web UI
+
+1. **Login to Proxmox Web Interface**
+
+2. **Click "Create CT" Button**
+
+3. **General Settings:**
+   - **CT ID:** 100 (or next available)
+   - **Hostname:** gpu-container
+   - **Password:** Set a secure password
+   - **SSH Public Key:** (Optional) Add for key-based auth
+
+4. **Template Selection:**
+   - **Storage:** local (or your preferred storage)
+   - **Template:** ubuntu-22.04-standard_22.04-1_amd64.tar.zst
+   - Alternative: debian-12-standard_12.0-1_amd64.tar.zst
+
+5. **Root Disk:**
+   - **Storage:** local-lvm (or your preferred)
+   - **Disk size:** 32 GiB minimum (more for ML workloads)
+
+6. **CPU Configuration:**
+   - **Cores:** 4 minimum (8+ recommended for ML)
+
+7. **Memory:**
+   - **Memory:** 8192 MB minimum
+   - **Swap:** 4096 MB
+
+8. **Network:**
+   - **Bridge:** vmbr0
+   - **IPv4:** DHCP or Static
+   - **IPv6:** As needed
+
+9. **DNS:**
+   - Use host settings or configure custom
+
+10. **Confirm and Create**
+
+### Option 2: Create Container via CLI
+
+```bash
+# Download template if not already available
+pveam download local ubuntu-22.04-standard_22.04-1_amd64.tar.zst
+
+# Create container
+pct create 100 local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst \
+  --hostname gpu-container \
+  --memory 8192 \
+  --swap 4096 \
+  --cores 4 \
+  --rootfs local-lvm:32 \
+  --net0 name=eth0,bridge=vmbr0,ip=dhcp \
+  --password yourpassword \
+  --features nesting=1,fuse=1 \
+  --unprivileged 1
+```
+
+### Configure Container Options
+
+Before starting the container:
+
+```bash
+# Enable required features
+pct set 100 --features nesting=1,fuse=1
+
+# For development containers, optionally enable keyctl
+pct set 100 --features nesting=1,fuse=1,keyctl=1
+```
+
+---
+
+## Configuring Container for GPU Access
+
+### 1. Stop Container (if running)
+
+```bash
+pct stop 100
+```
+
+### 2. Edit Container Configuration
+
+```bash
+# Backup original configuration
+cp /etc/pve/lxc/100.conf /etc/pve/lxc/100.conf.backup
+
+# Edit configuration
+nano /etc/pve/lxc/100.conf
+```
+
+### 3. Add GPU Configuration
+
+#### For NVIDIA GPUs (Single GPU)
+
+Add these lines at the end of the configuration file:
+
+```bash
+# NVIDIA GPU Support
+# Device permissions - cgroup2 format for Proxmox 7+
+lxc.cgroup2.devices.allow: c 195:* rwm
+lxc.cgroup2.devices.allow: c 509:* rwm
+lxc.cgroup2.devices.allow: c 511:* rwm
+lxc.cgroup2.devices.allow: c 189:* rwm
+lxc.cgroup2.devices.allow: c 234:* rwm
+lxc.cgroup2.devices.allow: c 237:* rwm
+
+# NVIDIA device mounts
+lxc.mount.entry: /dev/nvidia0 dev/nvidia0 none bind,optional,create=file
+lxc.mount.entry: /dev/nvidiactl dev/nvidiactl none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-uvm dev/nvidia-uvm none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-modeset dev/nvidia-modeset none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-uvm-tools dev/nvidia-uvm-tools none bind,optional,create=file
+
+# NVIDIA capabilities device (for CUDA 11.0+)
+lxc.mount.entry: /dev/nvidia-caps dev/nvidia-caps none bind,optional,create=dir
+
+# Additional library mounts for driver compatibility
+lxc.mount.entry: /usr/lib/x86_64-linux-gnu/nvidia usr/lib/x86_64-linux-gnu/nvidia none bind,optional,create=dir
+```
+
+#### For Multiple NVIDIA GPUs
+
+```bash
+# Add entries for each additional GPU
+lxc.mount.entry: /dev/nvidia1 dev/nvidia1 none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia2 dev/nvidia2 none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia3 dev/nvidia3 none bind,optional,create=file
+```
+
+#### For AMD GPUs
+
+```bash
+# AMD GPU Support
+# Device permissions
+lxc.cgroup2.devices.allow: c 226:* rwm
+lxc.cgroup2.devices.allow: c 234:* rwm
+
+# AMD device mounts
+lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir
+lxc.mount.entry: /dev/kfd dev/kfd none bind,optional,create=file
+
+# For ROCm support
+lxc.mount.entry: /sys/devices/virtual/kfd/kfd sys/devices/virtual/kfd/kfd none bind,optional,create=file
+```
+
+### 4. Set Device Permissions on Host
+
+```bash
+# Create udev rules for persistent permissions
+cat > /etc/udev/rules.d/70-nvidia.rules << 'EOF'
+# NVIDIA GPU devices
+KERNEL=="nvidia", MODE="0666"
+KERNEL=="nvidia-uvm", MODE="0666"
+KERNEL=="nvidia-uvm-tools", MODE="0666"
+KERNEL=="nvidia-modeset", MODE="0666"
+KERNEL=="nvidiactl", MODE="0666"
+EOF
+
+# Reload udev rules
+udevadm control --reload-rules
+udevadm trigger
+
+# Verify permissions
+ls -la /dev/nvidia*
+```
+
+### 5. Start Container
+
+```bash
+pct start 100
+
+# Check for errors
+pct status 100
+journalctl -u pve-container@100 -n 50
+```
+
+---
+
+## Installing Software Inside Container
+
+### 1. Enter Container
+
+```bash
+pct enter 100
+# or
+pct console 100
+```
+
+### 2. Initial System Update
+
+```bash
+# Update package lists
+apt update && apt upgrade -y
+
+# Install essential tools
+apt install -y \
+    curl \
+    wget \
+    gnupg \
+    lsb-release \
+    software-properties-common \
+    build-essential \
+    git \
+    htop \
+    nano \
+    pciutils
+```
+
+### 3. Install NVIDIA Container Stack
+
+#### Step 1: Add NVIDIA Package Repositories
+
+```bash
+# Install prerequisites
+apt install -y curl gnupg
+
+# Add NVIDIA Container Toolkit repository
+distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list | \
+  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+  tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+# Update package lists
+apt update
+```
+
+#### Step 2: Install NVIDIA Tools
+
+```bash
+# Install NVIDIA container runtime
+apt install -y nvidia-container-toolkit nvidia-container-runtime
+
+# Install NVIDIA utilities (match host driver version!)
+# Check host version with: nvidia-smi
+apt install -y nvidia-utils-550  # Replace 550 with your host driver version
+
+# Install CUDA toolkit (optional, for development)
+# Option 1: From Ubuntu repository (older but stable)
+apt install -y nvidia-cuda-toolkit
+
+# Option 2: From NVIDIA repository (latest)
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+dpkg -i cuda-keyring_1.1-1_all.deb
+apt update
+apt install -y cuda-toolkit-12-3  # Replace with desired version
+```
+
+### 4. Install Docker (Recommended)
+
+```bash
+# Install Docker
+curl -fsSL https://get.docker.com -o get-docker.sh
+sh get-docker.sh
+
+# Add current user to docker group
+usermod -aG docker $USER
+
+# Configure Docker for NVIDIA GPU support
+nvidia-ctk runtime configure --runtime=docker
+systemctl restart docker
+
+# Verify Docker GPU support
+docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi
+```
+
+### 5. Install Docker Compose (Optional)
+
+```bash
+# Install Docker Compose v2
+apt install -y docker-compose-plugin
+
+# Verify installation
+docker compose version
+```
+
+### 6. Install Development Tools
+
+#### For Python Development
+
+```bash
+# Install Python and pip
+apt install -y python3 python3-pip python3-dev python3-venv
+
+# Upgrade pip
+python3 -m pip install --upgrade pip
+
+# Install common ML/AI libraries
+pip3 install numpy pandas matplotlib seaborn scikit-learn jupyter
+
+# Install PyTorch with CUDA support
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# Install TensorFlow with GPU support
+pip3 install tensorflow[and-cuda]
+
+# Install other ML tools
+pip3 install transformers accelerate xformers
+```
+
+#### For Container Development
+
+```bash
+# Install Kubernetes tools (optional)
+curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" | tee /etc/apt/sources.list.d/kubernetes.list
+apt update
+apt install -y kubectl
+
+# Install k3s (lightweight Kubernetes)
+curl -sfL https://get.k3s.io | sh -
+```
+
+---
+
+## Testing and Verification
+
+### 1. Basic GPU Detection
+
+```bash
+# Check if GPU is visible
+nvidia-smi
+
+# Expected output shows:
+# - GPU model
+# - Driver version
+# - CUDA version
+# - Memory usage
+# - Running processes
+
+# Continuous monitoring
+watch -n 1 nvidia-smi
+```
+
+### 2. CUDA Verification
+
+```bash
+# Check CUDA compiler
+nvcc --version
+
+# Compile and run CUDA sample
+cat > /tmp/hello_cuda.cu << 'EOF'
+#include <stdio.h>
+
+__global__ void hello_cuda() {
+    printf("Hello from GPU thread %d!\n", threadIdx.x);
+}
+
+int main() {
+    hello_cuda<<<1, 10>>>();
+    cudaDeviceSynchronize();
+    return 0;
+}
+EOF
+
+nvcc /tmp/hello_cuda.cu -o /tmp/hello_cuda
+/tmp/hello_cuda
+```
+
+### 3. Python GPU Test
+
+```bash
+# Create test script
+cat > /tmp/gpu_test.py << 'EOF'
+import torch
+import tensorflow as tf
+
+print("=== PyTorch Test ===")
+print(f"PyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+    print(f"Number of GPUs: {torch.cuda.device_count()}")
+    
+    # Simple computation
+    x = torch.rand(1000, 1000).cuda()
+    y = torch.rand(1000, 1000).cuda()
+    z = torch.mm(x, y)
+    print(f"Matrix multiplication successful: {z.shape}")
+
+print("\n=== TensorFlow Test ===")
+print(f"TensorFlow version: {tf.__version__}")
+print(f"GPUs available: {tf.config.list_physical_devices('GPU')}")
+
+if tf.config.list_physical_devices('GPU'):
+    # Simple computation
+    with tf.device('/GPU:0'):
+        a = tf.constant([[1.0, 2.0], [3.0, 4.0]])
+        b = tf.constant([[1.0, 1.0], [0.0, 1.0]])
+        c = tf.matmul(a, b)
+        print(f"Matrix multiplication result:\n{c}")
+EOF
+
+python3 /tmp/gpu_test.py
+```
+
+### 4. Docker GPU Test
+
+```bash
+# Test with NVIDIA CUDA image
+docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi
+
+# Test with TensorFlow
+docker run --rm --gpus all tensorflow/tensorflow:latest-gpu \
+  python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+
+# Test with PyTorch
+docker run --rm --gpus all pytorch/pytorch:latest \
+  python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+
+# Run interactive GPU container
+docker run --rm -it --gpus all nvidia/cuda:12.0-devel bash
+```
+
+### 5. Performance Benchmarks
+
+```bash
+# Install GPU benchmarking tools
+apt install -y mesa-utils glmark2
+
+# Simple bandwidth test
+cat > /tmp/bandwidth_test.py << 'EOF'
+import torch
+import time
+
+def bandwidth_test(size_gb=1):
+    size = int(size_gb * 1024**3 / 4)  # Convert to float32 elements
+    
+    # Host to Device
+    host_tensor = torch.randn(size)
+    start = time.time()
+    device_tensor = host_tensor.cuda()
+    torch.cuda.synchronize()
+    h2d_time = time.time() - start
+    h2d_bandwidth = size_gb / h2d_time
+    
+    # Device to Host
+    start = time.time()
+    host_tensor = device_tensor.cpu()
+    torch.cuda.synchronize()
+    d2h_time = time.time() - start
+    d2h_bandwidth = size_gb / d2h_time
+    
+    print(f"Host to Device: {h2d_bandwidth:.2f} GB/s")
+    print(f"Device to Host: {d2h_bandwidth:.2f} GB/s")
+
+bandwidth_test()
+EOF
+
+python3 /tmp/bandwidth_test.py
+```
+
+---
+
+## Advanced Configurations
+
+### 1. Resource Limits and Quotas
+
+```bash
+# Edit container configuration
+nano /etc/pve/lxc/100.conf
+
+# Add resource limits
+# CPU limit (4 cores max)
+lxc.cgroup2.cpu.max: 400000 100000
+
+# Memory limit (16GB)
+lxc.cgroup2.memory.max: 17179869184
+lxc.cgroup2.memory.high: 16106127360
+
+# GPU memory limit (experimental, requires nvidia-container-cli)
+# This is application-specific, not enforced at container level
+```
+
+### 2. Multiple Containers Sharing GPU
+
+```bash
+# Create second container with same GPU config
+pct clone 100 101 --full
+
+# Modify hostname
+pct set 101 --hostname gpu-container-2
+
+# Start second container
+pct start 101
+
+# Both containers can now use the GPU
+# CUDA MPS (Multi-Process Service) can improve sharing efficiency
+```
+
+### 3. NVIDIA MPS (Multi-Process Service) Setup
+
+```bash
+# On host, start MPS daemon
+nvidia-smi -i 0 -c EXCLUSIVE_PROCESS
+nvidia-cuda-mps-control -d
+
+# In containers, set MPS pipe directory
+export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-log
+
+# Enable MPS for better GPU sharing
+echo start_server | nvidia-cuda-mps-control
+```
+
+### 4. Persistent Configuration
+
+```bash
+# Create systemd service for nvidia-persistenced
+cat > /etc/systemd/system/nvidia-persistenced.service << 'EOF'
+[Unit]
+Description=NVIDIA Persistence Daemon
+Wants=syslog.target
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/nvidia-persistenced --verbose
+ExecStopPost=/bin/rm -rf /var/run/nvidia-persistenced
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable nvidia-persistenced
+systemctl start nvidia-persistenced
+```
+
+### 5. GPU Monitoring Stack
+
+```bash
+# Install Prometheus GPU exporter
+docker run -d \
+  --name gpu-exporter \
+  --gpus all \
+  -p 9835:9835 \
+  mindprince/nvidia_gpu_prometheus_exporter:0.3.0
+
+# Install Grafana for visualization
+docker run -d \
+  --name grafana \
+  -p 3000:3000 \
+  -v grafana-storage:/var/lib/grafana \
+  grafana/grafana:latest
+
+# Access Grafana at http://container-ip:3000
+# Default login: admin/admin
+```
+
+### 6. Custom Docker Images with GPU Support
+
+```bash
+# Create Dockerfile
+cat > Dockerfile << 'EOF'
+FROM nvidia/cuda:12.0-cudnn8-devel-ubuntu22.04
+
+# Install Python and dependencies
+RUN apt-get update && apt-get install -y \
+    python3-pip \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install ML libraries
+RUN pip3 install --no-cache-dir \
+    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 \
+    tensorflow \
+    transformers \
+    accelerate
+
+# Set working directory
+WORKDIR /workspace
+
+CMD ["/bin/bash"]
+EOF
+
+# Build image
+docker build -t ml-gpu:latest .
+
+# Run container
+docker run --rm -it --gpus all ml-gpu:latest
+```
+
+---
+
+## Troubleshooting
+
+### Common Issues and Solutions
+
+#### 1. nvidia-smi: command not found
+
+```bash
+# Install nvidia-utils in container
+apt update
+apt install -y nvidia-utils-550  # Match your host driver version
+
+# If still not working, check PATH
+export PATH=$PATH:/usr/bin
+```
+
+#### 2. Failed to initialize NVML: Unknown Error
+
+```bash
+# On host, check if modules are loaded
+lsmod | grep nvidia
+
+# Load missing modules
+modprobe nvidia
+modprobe nvidia-uvm
+modprobe nvidia-modeset
+
+# Check dmesg for errors
+dmesg | grep -i nvidia
+```
+
+#### 3. CUDA Error: no kernel image is available
+
+```bash
+# This usually means CUDA version mismatch
+# Check versions
+nvidia-smi  # Shows driver CUDA version
+nvcc --version  # Shows toolkit version
+
+# Toolkit version must be <= driver CUDA version
+# Reinstall appropriate CUDA toolkit version
+```
+
+#### 4. Permission Denied on /dev/nvidia*
+
+```bash
+# On host, check permissions
+ls -la /dev/nvidia*
+
+# Fix permissions temporarily
+chmod 666 /dev/nvidia*
+
+# Fix permanently with udev rules (see earlier section)
+```
+
+#### 5. Container Won't Start
+
+```bash
+# Debug with verbose output
+lxc-start -n 100 -F -l DEBUG -o /tmp/lxc-100.log
+
+# Common issues:
+# - Typo in device paths
+# - Missing devices on host
+# - Syntax errors in config
+
+# Check container logs
+journalctl -u pve-container@100 -n 100
+```
+
+#### 6. Docker: could not select device driver "nvidia"
+
+```bash
+# Reconfigure Docker runtime
+nvidia-ctk runtime configure --runtime=docker
+systemctl restart docker
+
+# Check Docker daemon configuration
+cat /etc/docker/daemon.json
+
+# Should contain:
+{
+    "runtimes": {
+        "nvidia": {
+            "path": "nvidia-container-runtime",
+            "runtimeArgs": []
+        }
+    }
+}
+```
+
+#### 7. Out of Memory Errors
+
+```bash
+# Check GPU memory usage
+nvidia-smi
+
+# Clear GPU memory
+# Method 1: Kill processes
+nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -n1 kill -9
+
+# Method 2: Reset GPU (careful - affects all users)
+nvidia-smi --gpu-reset
+
+# Method 3: Restart container
+pct stop 100 && pct start 100
+```
+
+#### 8. Performance Issues
+
+```bash
+# Check GPU clock speeds
+nvidia-smi -q -d CLOCK
+
+# Set performance mode
+nvidia-smi -pm 1  # Persistence mode
+nvidia-smi -pl 300  # Power limit (adjust for your GPU)
+
+# Set application clocks (GPU specific)
+nvidia-smi -ac 5001,1980  # Memory,Graphics clocks
+
+# Monitor performance
+nvidia-smi dmon -s pucvmet
+```
+
+### Advanced Debugging
+
+#### 1. Enable Verbose Logging
+
+```bash
+# For NVIDIA drivers
+echo 'options nvidia NVreg_ResmanDebugLevel=WARNINGS' > /etc/modprobe.d/nvidia-debug.conf
+
+# For containers
+pct set 100 --debug 1
+```
+
+#### 2. Trace System Calls
+
+```bash
+# Install strace
+apt install -y strace
+
+# Trace nvidia-smi
+strace -e trace=open,ioctl nvidia-smi
+```
+
+#### 3. Check Kernel Messages
+
+```bash
+# Real-time kernel messages
+dmesg -w | grep -i nvidia
+
+# Journal for container
+journalctl -f -u pve-container@100
+```
+
+---
+
+## Best Practices
+
+### 1. Security Considerations
+
+```bash
+# Use unprivileged containers when possible
+pct set 100 --unprivileged 1
+
+# Limit device access to only required devices
+# Instead of c 195:* rwm, use specific device numbers
+
+# Enable AppArmor
+pct set 100 --features nesting=1,fuse=1,apparmor=1
+
+# Regular security updates
+apt update && apt upgrade -y
+```
+
+### 2. Backup Strategies
+
+```bash
+# Backup container configuration
+cp /etc/pve/lxc/100.conf /backup/lxc-100-$(date +%Y%m%d).conf
+
+# Create container snapshot
+pct snapshot 100 pre-gpu-setup
+
+# Full container backup
+vzdump 100 --storage local --compress zstd --mode snapshot
+```
+
+### 3. Monitoring Best Practices
+
+```bash
+# Create monitoring script
+cat > /usr/local/bin/gpu-monitor.sh << 'EOF'
+#!/bin/bash
+while true; do
+    clear
+    echo "=== GPU Status ==="
+    nvidia-smi
+    echo -e "\n=== Container Resources ==="
+    pct exec 100 -- df -h /
+    pct exec 100 -- free -h
+    echo -e "\n=== Top GPU Processes ==="
+    nvidia-smi pmon -i 0 -s m -c 1
+    sleep 5
+done
+EOF
+
+chmod +x /usr/local/bin/gpu-monitor.sh
+```
+
+### 4. Update Management
+
+```bash
+# Create update script
+cat > /usr/local/bin/update-gpu-container.sh << 'EOF'
+#!/bin/bash
+set -e
+
+# Update host
+apt update && apt upgrade -y
+
+# Update container
+pct exec 100 -- apt update
+pct exec 100 -- apt upgrade -y
+
+# Update Docker images
+pct exec 100 -- docker images --format "{{.Repository}}:{{.Tag}}" | \
+    xargs -I {} pct exec 100 -- docker pull {}
+
+echo "Updates completed successfully"
+EOF
+
+chmod +x /usr/local/bin/update-gpu-container.sh
+```
+
+### 5. Performance Optimization
+
+```bash
+# CPU affinity for GPU-intensive workloads
+pct set 100 --cpulimit 4 --cpuunits 2048
+
+# NUMA optimization (for multi-socket systems)
+pct set 100 --numa 1
+
+# Enable huge pages
+echo "vm.nr_hugepages = 512" >> /etc/sysctl.conf
+sysctl -p
+```
+
+---
+
+## Quick Reference Card
+
+### Essential Commands
+
+```bash
+# === Host Commands ===
+nvidia-smi                          # Check GPU status
+nvidia-smi -l 1                     # Continuous monitoring
+nvidia-smi --query-gpu=index,name,driver_version,memory.total,memory.used,memory.free,temperature.gpu,pstate,utilization.gpu,utilization.memory --format=csv
+pct list                            # List all containers
+pct start/stop/restart 100          # Container control
+pct enter 100                       # Enter container
+pct exec 100 -- command             # Execute command in container
+pct snapshot 100 snapname           # Create snapshot
+pct rollback 100 snapname           # Rollback to snapshot
+
+# === Container Commands ===
+nvidia-smi                          # Verify GPU access
+docker run --gpus all image         # Run GPU Docker container
+python3 -c "import torch; print(torch.cuda.is_available())"
+
+# === Monitoring Commands ===
+watch -n 1 nvidia-smi               # Real-time GPU monitoring
+htop                                # CPU and memory monitoring
+iotop                               # Disk I/O monitoring
+nethogs                             # Network monitoring
+
+# === Docker GPU Commands ===
+docker run --gpus all nvidia/cuda:12.0-base nvidia-smi
+docker run --gpus '"device=0"' image  # Specific GPU
+docker run --gpus all --shm-size=1g image  # Increase shared memory
+```
+
+### Configuration File Locations
+
+```bash
+/etc/pve/lxc/100.conf              # Container configuration
+/etc/modprobe.d/                   # Kernel module options
+/etc/modules-load.d/               # Auto-load modules
+/etc/udev/rules.d/                 # Device permissions
+/etc/docker/daemon.json            # Docker configuration
+/var/log/nvidia-installer.log      # NVIDIA installation log
+```
+
+### Common LXC GPU Configuration
+
+```bash
+# Minimal NVIDIA GPU config for /etc/pve/lxc/100.conf
+lxc.cgroup2.devices.allow: c 195:* rwm
+lxc.cgroup2.devices.allow: c 509:* rwm
+lxc.mount.entry: /dev/nvidia0 dev/nvidia0 none bind,optional,create=file
+lxc.mount.entry: /dev/nvidiactl dev/nvidiactl none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-uvm dev/nvidia-uvm none bind,optional,create=file
+```
+
+### Quick Fixes
+
+```bash
+# Fix GPU permissions
+chmod 666 /dev/nvidia*
+
+# Reload NVIDIA modules
+rmmod nvidia_uvm && modprobe nvidia_uvm
+
+# Reset GPU
+nvidia-smi --gpu-reset
+
+# Clear GPU memory
+nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -n1 kill -9
+
+# Restart Docker daemon
+systemctl restart docker
+```
+
+---
+
+## Appendix A: Sample Container Configurations
+
+### Machine Learning Development Container
+
+```bash
+# /etc/pve/lxc/100.conf
+arch: amd64
+cores: 8
+features: nesting=1,fuse=1,keyctl=1
+hostname: ml-dev
+memory: 32768
+net0: name=eth0,bridge=vmbr0,gw=192.168.1.1,hwaddr=XX:XX:XX:XX:XX:XX,ip=192.168.1.100/24,type=veth
+ostype: ubuntu
+rootfs: local-lvm:vm-100-disk-0,size=100G
+swap: 8192
+unprivileged: 1
+
+# GPU Configuration
+lxc.cgroup2.devices.allow: c 195:* rwm
+lxc.cgroup2.devices.allow: c 509:* rwm
+lxc.cgroup2.devices.allow: c 511:* rwm
+lxc.cgroup2.devices.allow: c 189:* rwm
+lxc.mount.entry: /dev/nvidia0 dev/nvidia0 none bind,optional,create=file
+lxc.mount.entry: /dev/nvidiactl dev/nvidiactl none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-uvm dev/nvidia-uvm none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-modeset dev/nvidia-modeset none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-uvm-tools dev/nvidia-uvm-tools none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-caps dev/nvidia-caps none bind,optional,create=dir
+```
+
+### Production Inference Container
+
+```bash
+# /etc/pve/lxc/101.conf
+arch: amd64
+cores: 4
+features: nesting=1
+hostname: inference-prod
+memory: 16384
+net0: name=eth0,bridge=vmbr0,gw=192.168.1.1,hwaddr=XX:XX:XX:XX:XX:XX,ip=192.168.1.101/24,type=veth
+ostype: ubuntu
+rootfs: local-lvm:vm-101-disk-0,size=50G
+swap: 4096
+unprivileged: 1
+
+# GPU Configuration (minimal for inference)
+lxc.cgroup2.devices.allow: c 195:* rwm
+lxc.cgroup2.devices.allow: c 509:* rwm
+lxc.mount.entry: /dev/nvidia0 dev/nvidia0 none bind,optional,create=file
+lxc.mount.entry: /dev/nvidiactl dev/nvidiactl none bind,optional,create=file
+lxc.mount.entry: /dev/nvidia-uvm dev/nvidia-uvm none bind,optional,create=file
+
+# Resource limits
+lxc.cgroup2.cpu.max: 400000 100000
+lxc.cgroup2.memory.max: 17179869184
+```
+
+---
+
+## Appendix B: Automation Scripts
+
+### Complete Setup Script
+
+```bash
+#!/bin/bash
+# save as: setup-gpu-lxc.sh
+
+set -e
+
+# Configuration
+CONTAINER_ID=100
+CONTAINER_HOSTNAME="gpu-container"
+CONTAINER_PASSWORD="changeme"
+CONTAINER_MEMORY=8192
+CONTAINER_DISK=32
+CONTAINER_CORES=4
+NVIDIA_DRIVER_VERSION="535"
+
+echo "=== Proxmox GPU LXC Setup Script ==="
+
+# Step 1: Update Proxmox
+echo "Updating Proxmox..."
+apt update && apt dist-upgrade -y
+
+# Step 2: Configure repositories
+echo "Configuring repositories..."
+sed -i 's/bookworm main/bookworm main contrib non-free non-free-firmware/g' /etc/apt/sources.list
+sed -i 's/bookworm-updates main/bookworm-updates main contrib non-free non-free-firmware/g' /etc/apt/sources.list
+sed -i 's/bookworm-security main/bookworm-security main contrib non-free non-free-firmware/g' /etc/apt/sources.list
+apt update
+
+# Step 3: Install prerequisites
+echo "Installing prerequisites..."
+apt install -y pve-headers-$(uname -r) build-essential dkms pve-firmware
+
+# Step 4: Blacklist nouveau
+echo "Blacklisting nouveau driver..."
+cat > /etc/modprobe.d/blacklist-nouveau.conf << 'EOF'
+blacklist nouveau
+options nouveau modeset=0
+EOF
+update-initramfs -u
+
+# Step 5: Install NVIDIA Drivers
+echo "Installing NVIDIA drivers..."
+# Try standard installation
+apt install -y nvidia-kernel-source
+if ! apt install -y nvidia-kernel-dkms; then
+    echo "Standard installation failed, trying manual firmware installation..."
+    cd /tmp
+    wget http://ftp.debian.org/debian/pool/non-free-firmware/n/nvidia-graphics-drivers/firmware-nvidia-gsp_${NVIDIA_DRIVER_VERSION}.247.01-1~deb12u1_amd64.deb
+    dpkg -i firmware-nvidia-gsp_${NVIDIA_DRIVER_VERSION}.247.01-1~deb12u1_amd64.deb
+    apt install -y nvidia-kernel-dkms
+fi
+apt install -y nvidia-driver-bin nvidia-driver-libs nvidia-driver
+
+# Step 6: Create udev rules
+echo "Creating udev rules..."
+cat > /etc/udev/rules.d/70-nvidia.rules << 'EOF'
+KERNEL=="nvidia", MODE="0666"
+KERNEL=="nvidia-uvm", MODE="0666"
+KERNEL=="nvidia-uvm-tools", MODE="0666"
+KERNEL=="nvidia-modeset", MODE="0666"
+KERNEL=="nvidiactl", MODE="0666"
+EOF
+
+udevadm control --reload-rules
+udevadm trigger
+
+# Step 7: Load NVIDIA modules at boot
+echo "Configuring module loading..."
+cat > /etc/modules-load.d/nvidia.conf << 'EOF'
+nvidia
+nvidia-uvm
+nvidia-modeset
+nvidia-drm
+EOF
+
+# Step 8: Enable nvidia-persistenced
+systemctl enable nvidia-persistenced
+systemctl start nvidia-persistenced || true
+
+echo "=== Host preparation complete. Rebooting... ==="
+echo "After reboot, run: nvidia-smi"
+echo "Then continue with container creation"
+reboot
+```
+
+---
+
+## Appendix C: Docker Compose Examples
+
+### Jupyter Lab with GPU
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  jupyter:
+    image: jupyter/tensorflow-notebook:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - JUPYTER_ENABLE_LAB=yes
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - jupyter-data:/home/jovyan/.local
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  jupyter-data:
+```
+
+### Stable Diffusion Web UI
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  stable-diffusion:
+    image: universonic/stable-diffusion-webui:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CLI_ARGS=--medvram --xformers --api
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./models:/app/stable-diffusion-webui/models
+      - ./outputs:/app/stable-diffusion-webui/outputs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+```
+
+---
+
+## Conclusion
+
+This guide provides everything you need to successfully implement GPU passthrough to LXC containers on Proxmox. The LXC approach offers superior performance and flexibility compared to traditional VM passthrough, making it ideal for development, machine learning, and production workloads.
+
+### Key Takeaways:
+- LXC containers provide near-native GPU performance
+- No complex IOMMU configuration required
+- Multiple containers can efficiently share a single GPU
+- Perfect for Docker-based workflows
+- Suitable for both development and production use
+
+### Next Steps:
+1. Start with a test container to validate your setup
+2. Gradually move workloads from VMs to containers
+3. Implement monitoring and backup strategies
+4. Join the Proxmox community for support and updates
+
+### Resources:
+- Proxmox Documentation: https://pve.proxmox.com/pve-docs/
+- NVIDIA Container Toolkit: https://github.com/NVIDIA/nvidia-container-toolkit
+- Docker GPU Support: https://docs.docker.com/config/containers/resource_constraints/#gpu
+- LXC Documentation: https://linuxcontainers.org/lxc/documentation/
+
+---
+
+**Document Version:** 1.0  
+**Last Updated:** May 2025  
+**Author:** Proxmox GPU Passthrough Guide  
+**License:** CC BY-SA 4.0
+
+---
+
+*This guide is provided as-is. Always backup your system before making significant changes. Test thoroughly in a non-production environment first.*
